@@ -210,7 +210,7 @@ func TestGlobalBytesQuotaReject(t *testing.T) {
 	if atomic.LoadInt64(&code13) == 0 {
 		t.Fatalf("at least one session must end with quota reason code=13, got %d", code13)
 	}
-	log.Printf("场景=全局字节配额 连接状态=大帧会话以code13终止 判定依据=OnSessionEnd计数=%d", code13)
+	log.Printf("场景=全局字节配额 连接状态=大帧会话以code13终止 判定依据=OnSessionEnd计数=%d", atomic.LoadInt64(&code13))
 }
 
 func TestShutdownRace(t *testing.T) {

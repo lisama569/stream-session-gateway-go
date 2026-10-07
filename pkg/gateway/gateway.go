@@ -17,9 +17,60 @@ import (
 	"sync/atomic"
 	"time"
 
+	"github.com/lisama569/stream-session-gateway-go/pkg/mux"
 	"github.com/lisama569/stream-session-gateway-go/pkg/quota"
 	"github.com/lisama569/stream-session-gateway-go/pkg/session"
 )
+
+// EndState 是一条连接终结时的状态/原因快照（与后端是单路 session 还是
+// 多路 mux 无关）。
+type EndState struct {
+	Forced bool
+	Code   uint16
+	Text   string
+}
+
+// connHandle 抽象单路 session 与多路 mux 连接的公共生命周期操作，
+// 使网关的接入/停机/配额逻辑可在两种后端间复用。
+type connHandle interface {
+	Run(ctx context.Context) error
+	State() int // 0=active ... 4=closed 5=force_terminated（两套实现编码一致）
+	ReasonText() string
+	ReasonCode() uint16
+	GracefulClose(grace time.Duration) error
+	ForceClose(code uint16, text string, forced bool) error
+}
+
+// 适配器：把两套状态机包成 connHandle。
+type sessionHandle struct {
+	s *session.Session
+}
+
+func (h sessionHandle) Run(ctx context.Context) error { return h.s.Run(ctx) }
+func (h sessionHandle) State() int                    { return int(h.s.State()) }
+func (h sessionHandle) ReasonText() string            { return h.s.Reason().Text }
+func (h sessionHandle) ReasonCode() uint16            { return h.s.Reason().Code }
+func (h sessionHandle) GracefulClose(d time.Duration) error {
+	return h.s.GracefulClose(d)
+}
+func (h sessionHandle) ForceClose(code uint16, text string, forced bool) error {
+	return h.s.ForceClose(session.CloseReason{Code: code, Text: text, Forced: forced})
+}
+
+type muxHandle struct {
+	c *mux.Conn
+}
+
+func (h muxHandle) Run(ctx context.Context) error { return h.c.Run(ctx) }
+func (h muxHandle) State() int                    { return int(h.c.State()) }
+func (h muxHandle) ReasonText() string            { return h.c.Reason().Text }
+func (h muxHandle) ReasonCode() uint16            { return h.c.Reason().Code }
+func (h muxHandle) GracefulClose(d time.Duration) error {
+	return h.c.GracefulClose(d)
+}
+func (h muxHandle) ForceClose(code uint16, text string, forced bool) error {
+	return h.c.ForceClose(mux.CloseReason{Code: code, Text: text, Forced: forced})
+}
 
 // ErrClosed 表示网关已关闭/停机期间被调用。
 var ErrClosed = errors.New("gateway: closed")
@@ -35,10 +86,18 @@ type Config struct {
 	GlobalBytes    int64 // 全局所有会话在途+待写字节总预算；<=0 不限
 	Session        session.Options
 
+	// Multiplex=true 时每条连接按多路逻辑流（pkg/mux）运行，
+	// 此时使用 Mux 选项与 MuxHandler；否则用单路 Session/Handler。
+	Multiplex  bool
+	Mux        mux.Options
+	MuxHandler mux.Handler
+
 	ShutdownGrace time.Duration // Shutdown 默认宽限；<=0 使用 5s
 
-	// OnSessionEnd 在每个会话终结后回调（状态与原因快照），可观测/测试用。
+	// OnSessionEnd 在每个单路会话终结后回调（仅非多路模式触发）。
 	OnSessionEnd func(id uint64, st session.State, reason session.CloseReason)
+	// OnConnEnd 在每个连接终结后回调，后端无关（单路/多路均触发）。
+	OnConnEnd func(id uint64, st EndState)
 }
 
 // Stats 是网关计数器快照。
@@ -67,9 +126,9 @@ type Gateway struct {
 	rejDown   atomic.Int64
 
 	sessionsMu sync.Mutex
-	sessions   map[uint64]*session.Session
+	sessions   map[uint64]connHandle
 
-	wg sync.WaitGroup // 所有会话 Run
+	wg sync.WaitGroup // 所有连接 Run
 
 	logf func(string, ...any)
 }
@@ -87,9 +146,17 @@ func New(h session.Handler, cfg Config) *Gateway {
 		handler:  h,
 		gate:     quota.NewGate(cfg.MaxConnections),
 		bytes:    quota.NewLimiter(cfg.GlobalBytes),
-		sessions: make(map[uint64]*session.Session),
+		sessions: make(map[uint64]connHandle),
 		logf:     func(string, ...any) {},
 	}
+}
+
+// NewMux 创建多路复用模式的网关。
+func NewMux(h mux.Handler, cfg Config) *Gateway {
+	cfg.Multiplex = true
+	cfg.MuxHandler = h
+	g := New(nil, cfg)
+	return g
 }
 
 // SetLogger 注入日志函数（默认静默）。
@@ -213,28 +280,50 @@ func (g *Gateway) handleConn(conn net.Conn) {
 	}
 
 	id := g.idCounter.Add(1)
-	sess := session.New(id, conn, g.handler, g.cfg.Session)
-	sess.SetGlobalLimiter(g.bytes)
+	var handle connHandle
+	if g.cfg.Multiplex {
+		mc := mux.New(id, conn, g.cfg.MuxHandler, g.cfg.Mux)
+		mc.SetGlobalLimiter(g.bytes)
+		if g.logf != nil {
+			mc.SetLogger(g.logf)
+		}
+		handle = muxHandle{c: mc}
+	} else {
+		sess := session.New(id, conn, g.handler, g.cfg.Session)
+		sess.SetGlobalLimiter(g.bytes)
+		handle = sessionHandle{s: sess}
+	}
 
 	g.sessionsMu.Lock()
-	g.sessions[id] = sess
+	g.sessions[id] = handle
 	g.sessionsMu.Unlock()
 	g.accepted.Add(1)
-	g.logf("场景=接入 id=%d 远端=%s 活跃=%d", id, conn.RemoteAddr(), g.ActiveSessions())
+	g.logf("场景=接入 id=%d mux=%v 远端=%s 活跃=%d",
+		id, g.cfg.Multiplex, conn.RemoteAddr(), g.ActiveSessions())
 
 	g.wg.Add(1)
 	go func() {
 		defer g.wg.Done()
-		_ = sess.Run(context.Background())
+		_ = handle.Run(context.Background())
 		g.sessionsMu.Lock()
 		delete(g.sessions, id)
 		g.sessionsMu.Unlock()
 		g.gate.Leave()
-		if g.cfg.OnSessionEnd != nil {
-			g.cfg.OnSessionEnd(id, sess.State(), sess.Reason())
+		end := EndState{
+			Forced: handle.State() == int(mux.StateForceTerminated),
+			Code:   handle.ReasonCode(),
+			Text:   handle.ReasonText(),
 		}
-		g.logf("场景=会话结束 id=%d state=%s reason=%s 活跃=%d",
-			id, sess.State(), sess.Reason(), g.ActiveSessions())
+		if g.cfg.OnConnEnd != nil {
+			g.cfg.OnConnEnd(id, end)
+		}
+		if !g.cfg.Multiplex && g.cfg.OnSessionEnd != nil {
+			if sh, ok := handle.(sessionHandle); ok {
+				g.cfg.OnSessionEnd(id, sh.s.State(), sh.s.Reason())
+			}
+		}
+		g.logf("场景=连接结束 id=%d state=%d reason=%s 活跃=%d",
+			id, handle.State(), handle.ReasonText(), g.ActiveSessions())
 	}()
 }
 
@@ -265,18 +354,18 @@ func (g *Gateway) Shutdown(grace time.Duration) error {
 	_ = g.beginShutdown()
 
 	g.sessionsMu.Lock()
-	snapshot := make([]*session.Session, 0, len(g.sessions))
+	snapshot := make([]connHandle, 0, len(g.sessions))
 	for _, s := range g.sessions {
 		snapshot = append(snapshot, s)
 	}
 	g.sessionsMu.Unlock()
 
-	g.logf("场景=发起宽限排空 在途会话=%d grace=%s", len(snapshot), grace)
+	g.logf("场景=发起宽限排空 在途连接=%d grace=%s", len(snapshot), grace)
 	for _, s := range snapshot {
 		_ = s.GracefulClose(grace)
 	}
 
-	// 等待所有会话结束；到点未结束者强制终止。
+	// 等待所有连接结束；到点未结束者强制终止（网关停机原因 code=4）。
 	done := make(chan struct{})
 	go func() { g.wg.Wait(); close(done) }()
 	select {
@@ -285,10 +374,10 @@ func (g *Gateway) Shutdown(grace time.Duration) error {
 		return nil
 	case <-time.After(grace + 100*time.Millisecond):
 		for _, s := range snapshot {
-			_ = s.ForceClose(session.ReasonGatewayDown)
+			s.ForceClose(4, "gateway shutting down", true)
 		}
 		<-done
-		g.logf("场景=网关宽限耗尽，已强制终止剩余会话")
+		g.logf("场景=网关宽限耗尽，已强制终止剩余连接")
 		return nil
 	}
 }

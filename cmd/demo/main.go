@@ -19,6 +19,7 @@ import (
 
 	"github.com/lisama569/stream-session-gateway-go/pkg/frame"
 	"github.com/lisama569/stream-session-gateway-go/pkg/gateway"
+	"github.com/lisama569/stream-session-gateway-go/pkg/mux"
 	"github.com/lisama569/stream-session-gateway-go/pkg/session"
 )
 
@@ -28,29 +29,59 @@ func main() {
 	globalBytes := flag.Int64("global-bytes", 64<<20, "global inflight/outbound bytes budget")
 	idle := flag.Duration("idle", 30*time.Second, "idle timeout")
 	grace := flag.Duration("grace", 3*time.Second, "shutdown grace")
+	muxMode := flag.Bool("mux", false, "enable per-connection logical stream multiplexing")
 	flag.Parse()
 
 	opts := session.DefaultOptions()
 	opts.IdleTimeout = *idle
 	opts.GracePeriod = *grace
 
-	g := gateway.New(session.HandlerFunc(func(ctx context.Context, s *session.Session, f *frame.Frame) {
-		log.Printf("recv id=%d stream=%d version=%d len=%d end=%v",
-			s.ID(), f.Stream, f.Version, len(f.Payload), f.EndStream())
-		if f.EndStream() {
-			_ = s.CloseWrite()
-			return
-		}
-		if err := s.Send(ctx, f); err != nil {
-			log.Printf("send id=%d err=%v", s.ID(), err)
-		}
-	}), gateway.Config{
-		Listen:         *addr,
-		MaxConnections: *maxConn,
-		GlobalBytes:    *globalBytes,
-		Session:        opts,
-		ShutdownGrace:  *grace,
-	})
+	var g *gateway.Gateway
+	if *muxMode {
+		mopts := mux.DefaultOptions()
+		mopts.IdleTimeout = *idle
+		mopts.GracePeriod = *grace
+		g = gateway.NewMux(mux.HandlerFunc(func(ctx context.Context, st *mux.Stream, f *frame.Frame) {
+			log.Printf("recv conn=%d stream=%d v=%d len=%d end=%v",
+				st.Conn().ID(), f.Stream, f.Version, len(f.Payload), f.EndStream())
+			if f.EndStream() {
+				_ = st.CloseWrite()
+				return
+			}
+			if err := st.Send(ctx, f); err != nil {
+				if qe, ok := mux.IsQuotaError(err); ok {
+					log.Printf("send quota rejected conn=%d stream=%d scope=%s dir=%s reason=%s",
+						st.Conn().ID(), f.Stream, qe.Scope, qe.Direction, qe.Reason)
+					return
+				}
+				log.Printf("send conn=%d stream=%d err=%v", st.Conn().ID(), f.Stream, err)
+			}
+		}), gateway.Config{
+			Listen:         *addr,
+			MaxConnections: *maxConn,
+			GlobalBytes:    *globalBytes,
+			Mux:            mopts,
+			ShutdownGrace:  *grace,
+		})
+	} else {
+		g = gateway.New(session.HandlerFunc(func(ctx context.Context, s *session.Session, f *frame.Frame) {
+			log.Printf("recv id=%d stream=%d version=%d len=%d end=%v",
+				s.ID(), f.Stream, f.Version, len(f.Payload), f.EndStream())
+			if f.EndStream() {
+				_ = s.CloseWrite()
+				return
+			}
+			if err := s.Send(ctx, f); err != nil {
+				log.Printf("send id=%d err=%v", s.ID(), err)
+			}
+		}), gateway.Config{
+			Listen:         *addr,
+			MaxConnections: *maxConn,
+			GlobalBytes:    *globalBytes,
+			Session:        opts,
+			ShutdownGrace:  *grace,
+		})
+	}
 	g.SetLogger(log.Printf)
 
 	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)

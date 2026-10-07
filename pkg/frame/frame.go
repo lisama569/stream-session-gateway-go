@@ -25,6 +25,9 @@ const (
 // 标志位。
 const (
 	FlagEndStream uint8 = 0x01
+	// FlagReset 表示 RST_STREAM：StreamID 字段给出被重置的路，
+	// 负载为可选的 UTF-8 原因文本。仅多路复用（pkg/mux）语义使用。
+	FlagReset uint8 = 0x02
 )
 
 // 协议常量。

@@ -18,6 +18,14 @@ const (
 	ReasonSessionOutboundBytes  Reason = "session_outbound_bytes_exceeded"
 	ReasonGlobalInflightBytes   Reason = "global_inflight_bytes_exceeded"
 	ReasonGlobalConnections     Reason = "global_connections_exceeded"
+
+	// 多路复用（pkg/mux）维度的拒绝原因。
+	ReasonMuxActiveStreams        Reason = "mux_active_streams_exceeded"
+	ReasonMuxConnInflightBytes    Reason = "mux_conn_inflight_bytes_exceeded"
+	ReasonMuxConnOutboundBytes    Reason = "mux_conn_outbound_bytes_exceeded"
+	ReasonMuxStreamInflightFrames Reason = "mux_stream_inflight_frames_exceeded"
+	ReasonMuxStreamInflightBytes  Reason = "mux_stream_inflight_bytes_exceeded"
+	ReasonMuxStreamOutboundBytes  Reason = "mux_stream_outbound_bytes_exceeded"
 )
 
 // ErrRejected 是所有配额拒绝错误的哨兵，便于 errors.Is 统一判定。
