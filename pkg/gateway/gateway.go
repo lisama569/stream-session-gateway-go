@@ -35,6 +35,11 @@ type Config struct {
 	GlobalBytes    int64 // 全局所有会话在途+待写字节总预算；<=0 不限
 	Session        session.Options
 
+	// StreamHandler 非 nil 时，每个会话启用一条连接多路逻辑流模式：
+	// 按帧头 StreamID 分派，同路保序、跨路并发且互不阻塞。
+	// 与单路 Handler 二选一；同时设置时以 StreamHandler 为准。
+	StreamHandler session.StreamHandler
+
 	ShutdownGrace time.Duration // Shutdown 默认宽限；<=0 使用 5s
 
 	// OnSessionEnd 在每个会话终结后回调（状态与原因快照），可观测/测试用。
@@ -50,8 +55,9 @@ type Stats struct {
 
 // Gateway 本地双向流会话网关。
 type Gateway struct {
-	cfg     Config
-	handler session.Handler
+	cfg           Config
+	handler       session.Handler
+	streamHandler session.StreamHandler
 
 	mu        sync.Mutex
 	ln        net.Listener
@@ -83,12 +89,13 @@ func New(h session.Handler, cfg Config) *Gateway {
 		cfg.ShutdownGrace = 5 * time.Second
 	}
 	return &Gateway{
-		cfg:      cfg,
-		handler:  h,
-		gate:     quota.NewGate(cfg.MaxConnections),
-		bytes:    quota.NewLimiter(cfg.GlobalBytes),
-		sessions: make(map[uint64]*session.Session),
-		logf:     func(string, ...any) {},
+		cfg:           cfg,
+		handler:       h,
+		streamHandler: cfg.StreamHandler,
+		gate:          quota.NewGate(cfg.MaxConnections),
+		bytes:         quota.NewLimiter(cfg.GlobalBytes),
+		sessions:      make(map[uint64]*session.Session),
+		logf:          func(string, ...any) {},
 	}
 }
 
@@ -214,6 +221,9 @@ func (g *Gateway) handleConn(conn net.Conn) {
 
 	id := g.idCounter.Add(1)
 	sess := session.New(id, conn, g.handler, g.cfg.Session)
+	if g.streamHandler != nil {
+		sess.SetStreamHandler(g.streamHandler)
+	}
 	sess.SetGlobalLimiter(g.bytes)
 
 	g.sessionsMu.Lock()

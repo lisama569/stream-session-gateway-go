@@ -18,6 +18,12 @@ const (
 	ReasonSessionOutboundBytes  Reason = "session_outbound_bytes_exceeded"
 	ReasonGlobalInflightBytes   Reason = "global_inflight_bytes_exceeded"
 	ReasonGlobalConnections     Reason = "global_connections_exceeded"
+
+	// 多路复用维度：单路在途/待写，以及连接上存活路数上限。
+	ReasonStreamInflightFrames Reason = "stream_inflight_frames_exceeded"
+	ReasonStreamInflightBytes  Reason = "stream_inflight_bytes_exceeded"
+	ReasonStreamOutboundBytes  Reason = "stream_outbound_bytes_exceeded"
+	ReasonConnActiveStreams    Reason = "conn_active_streams_exceeded"
 )
 
 // ErrRejected 是所有配额拒绝错误的哨兵，便于 errors.Is 统一判定。

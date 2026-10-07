@@ -1,6 +1,10 @@
 package session
 
-import "time"
+import (
+	"time"
+
+	"github.com/lisama569/stream-session-gateway-go/pkg/mux"
+)
 
 const (
 	PolicyReject uint8 = 0
@@ -35,6 +39,14 @@ type Options struct {
 	// 但应用层需自行保证顺序）；默认 false：同一会话严格按接收顺序串行
 	// 处理，保证不串包、不乱序。
 	ConcurrentHandlers bool
+
+	// Mux 多路复用配置。零值（MaxStreams==0 等）不代表关闭；
+	// 是否启用以 EnableMux 字段为准。
+	Mux mux.Config
+	// EnableMux 为 true 时，一条连接按帧头 StreamID 承载多路逻辑流：
+	// 每路独立串行处理、独立配额与半关闭。stream 0 为连接级控制流，
+	// 其 END_STREAM 保持连接级半关闭语义。
+	EnableMux bool
 }
 
 // DefaultOptions 返回带合理默认值的选项：

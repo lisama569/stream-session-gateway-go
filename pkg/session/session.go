@@ -11,6 +11,7 @@ import (
 	"time"
 
 	"github.com/lisama569/stream-session-gateway-go/pkg/frame"
+	"github.com/lisama569/stream-session-gateway-go/pkg/mux"
 	"github.com/lisama569/stream-session-gateway-go/pkg/quota"
 )
 
@@ -21,7 +22,7 @@ var (
 	ErrQuotaRejected = errors.New("session: quota rejected")
 )
 
-// Handler 处理每帧应用逻辑；由使用方实现。
+// Handler 处理每帧应用逻辑；由使用方实现（单路模式）。
 type Handler interface {
 	OnFrame(ctx context.Context, s *Session, f *frame.Frame)
 }
@@ -33,6 +34,18 @@ func (fn HandlerFunc) OnFrame(ctx context.Context, s *Session, f *frame.Frame) {
 	fn(ctx, s, f)
 }
 
+// StreamHandler 处理多路模式下某一路的帧；同一流严格串行、不同流并发。
+type StreamHandler = mux.Handler
+
+// StreamHandlerFunc 是 StreamHandler 的函数适配器。
+type StreamHandlerFunc = mux.HandlerFunc
+
+// Stream 是多路逻辑流句柄的别名，便于从 session 包直接使用。
+type Stream = mux.Stream
+
+// MuxStats 多路计数快照别名。
+type MuxStats = mux.Stats
+
 // maxProtocolErrors 是连续坏帧（已重同步）的容忍上限，
 // 超过则以协议错误终止，避免异常链路无限空转。
 const maxProtocolErrors = 8
@@ -40,6 +53,7 @@ const maxProtocolErrors = 8
 type outItem struct {
 	buf       []byte
 	endStream bool // 写成功后本端写侧半关闭（TCP CloseWrite）
+	release   func()
 }
 
 // dispatched 是已解码、已占入站配额、待执行的处理任务。
@@ -97,6 +111,10 @@ type Session struct {
 	outClosed bool
 
 	activity chan struct{}
+
+	// 多路复用（opts.EnableMux 时启用）。
+	mx         *mux.Mux
+	muxHandler mux.Handler
 }
 
 // New 基于已建立的本地连接构造会话（不启动读写循环）。
@@ -128,6 +146,91 @@ func New(id uint64, conn net.Conn, h Handler, opts Options) *Session {
 
 // SetGlobalLimiter 把会话挂到网关级全局字节预算上；必须在 Run 前调用。
 func (s *Session) SetGlobalLimiter(l *quota.Limiter) { s.globalBytes = l }
+
+// SetStreamHandler 配置多路处理器；必须在 Run 之前调用。
+// 调用即等价于为该会话启用多路模式（opts.EnableMux 会被置位）。
+func (s *Session) SetStreamHandler(h mux.Handler) {
+	s.muxHandler = h
+	s.opts.EnableMux = true
+}
+
+// Mux 暴露多路复用器（未启用时为 nil）。
+func (s *Session) Mux() *mux.Mux { return s.mx }
+
+// setupMux 在 Run 启动前一次性装配多路复用器及其与本会话的接缝。
+func (s *Session) setupMux(h mux.Handler) {
+	cfg := s.opts.Mux
+	if cfg.GracePeriod <= 0 {
+		cfg.GracePeriod = s.opts.GracePeriod
+	}
+	policy := mux.PolicyBlock
+	if s.opts.InflightPolicy == PolicyReject {
+		policy = mux.PolicyReject
+	}
+	cfg.Policy = policy
+
+	deps := mux.Deps{
+		GlobalBytes:        s.globalBytes,
+		ConnInflightFrames: s.inflightFrames,
+		ConnInflightBytes:  s.inflightBytes,
+		ConnOutboundBytes:  s.outboundBytes,
+		StreamSlots:        quota.NewGate(cfg.MaxStreams),
+		EnqueueOut:         s.enqueueEncoded,
+		ConnCloseWrite:     s.CloseWrite,
+		ForceConn: func(code uint16, text string) {
+			s.forceClose(CloseReason{Code: code, Text: text, Forced: true})
+		},
+		Logf: s.logf,
+	}
+	s.mx = mux.New(h, cfg, deps)
+	s.mx.Start()
+}
+
+// enqueueEncoded 是多路出站接缝：入队一个已编码项，release 在写出或丢弃
+// （连接关闭）时恰好调用一次。outCh 关闭/入队被 ctx 取消时返回错误且不持有 release。
+func (s *Session) enqueueEncoded(ctx context.Context, buf []byte, endConn bool, release func()) error {
+	s.sendMu.Lock()
+	s.mu.Lock()
+	st := s.state
+	s.mu.Unlock()
+	if st.terminal() || st == StateClosing {
+		s.sendMu.Unlock()
+		return ErrClosed
+	}
+	if st == StateLocalHalf {
+		s.sendMu.Unlock()
+		return ErrHalfClosed
+	}
+	if s.outClosed {
+		s.sendMu.Unlock()
+		return ErrClosed
+	}
+	item := &outItem{buf: buf, endStream: endConn, release: release}
+	s.sendMu.Unlock()
+
+	select {
+	case s.outCh <- item:
+		return nil
+	case <-ctx.Done():
+		return ctx.Err()
+	}
+}
+
+// MuxStats 返回多路计数快照（未启用时返回零值）。
+func (s *Session) MuxStats() mux.Stats {
+	if s.mx == nil {
+		return mux.Stats{}
+	}
+	return s.mx.Stats()
+}
+
+// ActiveStreams 返回存活逻辑路数（未启用时为 0）。
+func (s *Session) ActiveStreams() int {
+	if s.mx == nil {
+		return 0
+	}
+	return s.mx.ActiveStreams()
+}
 
 func (s *Session) ID() uint64            { return s.id }
 func (s *Session) Done() <-chan struct{} { return s.done }
@@ -416,11 +519,18 @@ func (s *Session) runLocked(parent context.Context) {
 	}()
 	defer close(stopParent)
 
+	muxMode := s.opts.EnableMux && s.muxHandler != nil
+	if muxMode {
+		s.setupMux(s.muxHandler)
+	}
+
 	s.writerWG.Add(1)
 	go s.writeLoop(ctx)
-	if !s.opts.ConcurrentHandlers {
-		s.handlerWG.Add(1)
-		go s.serialWorker(ctx)
+	if !muxMode {
+		if !s.opts.ConcurrentHandlers {
+			s.handlerWG.Add(1)
+			go s.serialWorker(ctx)
+		}
 	}
 	if s.opts.IdleTimeout > 0 {
 		go s.idleWatchdog(ctx)
@@ -439,6 +549,9 @@ func (s *Session) runLocked(parent context.Context) {
 		// 强制终止：立即解除整个会话。关闭 jobCh 阻止新任务入队，
 		// 出站队列立即关闭丢弃待写项。
 		close(s.jobCh)
+		if muxMode {
+			s.mx.AbortAll("session force-terminated")
+		}
 		s.drainAndCloseOut(true)
 		s.writerWG.Wait()
 		s.finalize(readOutcome, true)
@@ -450,6 +563,11 @@ func (s *Session) runLocked(parent context.Context) {
 	closing := s.state == StateClosing
 	graceDl := s.graceDl
 	s.mu.Unlock()
+
+	if muxMode {
+		s.drainMuxMode(closing, graceDl, readOutcome)
+		return
+	}
 
 	if closing {
 		// 关闭 jobCh：串行 worker 会把当前帧处理完再退出（jobCh 无缓冲，
@@ -493,6 +611,46 @@ func (s *Session) drainAndCloseOut(discard bool) {
 	}
 }
 
+// drainMuxMode 处理多路模式读循环退出后的收尾：
+//   - GracefulClose 排空：BeginDrain → 等到 graceDl；期间在途路继续处理并可
+//     Send 结果；到期仍卡住的路被强制终止，整条连接以 ReasonGraceExpired
+//     （原因文本含卡住流 ID）终止，停机不被一路挂死。
+//   - 对端 EOF/END_STREAM 正常路径：关闭输入，让各路把已收帧处理完即收尾。
+func (s *Session) drainMuxMode(closing bool, graceDl time.Time, readOutcome readResult) {
+	if closing {
+		s.mx.BeginDrain(graceDl)
+		stuck := s.mx.WaitDrain(graceDl)
+		if len(stuck) > 0 {
+			r := ReasonGraceExpired
+			r.Text = fmt.Sprintf("grace drain expired, stuck streams=%v", stuck)
+			s.forceClose(r)
+			s.drainAndCloseOut(true)
+			s.writerWG.Wait()
+			s.finalize(readOutcome, true)
+			return
+		}
+		s.drainAndCloseOut(false)
+		s.writerWG.Wait()
+		s.finalize(readOutcome, false)
+		return
+	}
+	// 对端正常结束（EOF/控制流半闭后的 FIN）：停止接新帧，各路排空已收数据。
+	s.mx.BeginDrain(time.Now().Add(s.opts.GracePeriod))
+	dl := time.Now().Add(s.opts.GracePeriod)
+	stuck := s.mx.WaitDrain(dl)
+	if len(stuck) > 0 {
+		r := CloseReason{Code: 3, Text: fmt.Sprintf("peer closed but streams stuck=%v", stuck), Forced: true}
+		s.forceClose(r)
+		s.drainAndCloseOut(true)
+		s.writerWG.Wait()
+		s.finalize(readOutcome, true)
+		return
+	}
+	s.drainAndCloseOut(false)
+	s.writerWG.Wait()
+	s.finalize(readOutcome, false)
+}
+
 func (s *Session) finalize(readOutcome readResult, forced bool) {
 	cancel := s.runCancel
 	s.closeOnce.Do(func() {
@@ -526,6 +684,7 @@ func (s *Session) readLoop(ctx context.Context, aborted <-chan struct{}) readRes
 	var f frame.Frame
 	badStreak := 0
 	outcome := readResult{}
+	muxMode := s.mx != nil
 	for {
 		s.mu.Lock()
 		st := s.state
@@ -541,6 +700,11 @@ func (s *Session) readLoop(ctx context.Context, aborted <-chan struct{}) readRes
 			switch {
 			case errors.Is(err, io.EOF):
 				outcome.peerEOF = true
+				if muxMode {
+					// 多路模式：EOF 表示对端关闭整个写方向，停止接新帧，
+					// 已收帧交由各路排空；不做单路会话的半关闭等待。
+					s.mx.BeginDrain(time.Now())
+				}
 				return outcome
 			case errors.Is(err, io.ErrUnexpectedEOF):
 				outcome.err = err
@@ -565,6 +729,9 @@ func (s *Session) readLoop(ctx context.Context, aborted <-chan struct{}) readRes
 				var ne net.Error
 				if errors.As(err, &ne) && ne.Timeout() && s.isClosing() {
 					s.logf("场景=宽限读截止到达，停止接收 错误=%v", err)
+					if muxMode {
+						s.mx.BeginDrain(s.graceDl)
+					}
 					return outcome
 				}
 				outcome.err = err
@@ -579,6 +746,24 @@ func (s *Session) readLoop(ctx context.Context, aborted <-chan struct{}) readRes
 			s.forceClose(CloseReason{Code: 11,
 				Text: fmt.Sprintf("version mismatch: got %d want %d", f.Version, s.opts.NegotiatedVersion), Forced: true})
 			return outcome
+		}
+
+		if muxMode {
+			connHalf, derr := s.dispatchMuxFrame(ctx, &f)
+			if derr != nil {
+				return outcome
+			}
+			f = frame.Frame{}
+			if connHalf {
+				s.onPeerEndStream()
+				outcome.peerEOF = true
+				s.waitAfterPeerHalf(ctx)
+				if s.isForced() {
+					outcome.peerEOF = false
+				}
+				return outcome
+			}
+			continue
 		}
 
 		fr := f
@@ -672,6 +857,31 @@ func (s *Session) serialWorker(ctx context.Context) {
 	}
 }
 
+// dispatchMuxFrame 把一帧交给多路复用器，并把“连接级”拒绝翻译为连接终止；
+// 路级拒绝由 mux 自行丢帧/终止该路，读循环继续处理后续其它路的好帧。
+func (s *Session) dispatchMuxFrame(ctx context.Context, f *frame.Frame) (bool, error) {
+	connHalf, err := s.mx.Deliver(ctx, f)
+	if err == nil {
+		return connHalf, nil
+	}
+	if rj, ok := mux.AsReject(err); ok {
+		if rj.Scope == mux.ScopeStream {
+			// 理论上不可达：流级拒收已在 mux 内部吸收；防御性继续读后续帧。
+			s.logf("场景=路级入站拒收未吸收 stream=%d 原因=%s", rj.StreamID, rj.Error())
+			return false, nil
+		}
+		// 连接级/全局级收不下：终止整条连接，原因可区分级与方向。
+		s.logf("场景=连接级入站配额终止 错误=%v", rj)
+		s.forceClose(CloseReason{Code: 13, Text: rj.Error(), Forced: true})
+		return false, err
+	}
+	if ctx.Err() != nil || s.isForced() {
+		return false, nil
+	}
+	s.forceClose(CloseReason{Code: 13, Text: err.Error(), Forced: true})
+	return false, err
+}
+
 func (s *Session) isForced() bool {
 	s.mu.Lock()
 	defer s.mu.Unlock()
@@ -704,29 +914,39 @@ func (s *Session) onPeerEndStream() {
 	}
 }
 
+// releaseOutItem 归还一个已写出/已丢弃出站项占用的配额：
+// 多路项（带 release）由 mux 释放 全局/连接/路 三级；旧单路项由会话释放。
+// 恰好调用一次，杜绝重复归还。
+func (s *Session) releaseOutItem(item *outItem) {
+	if item.release != nil {
+		item.release()
+		return
+	}
+	s.releaseOutbound(int64(len(item.buf)))
+}
+
 // writeLoop 串行写出，保证帧不交错；outCh 关闭后排空剩余帧再退出。
 func (s *Session) writeLoop(ctx context.Context) {
 	defer s.writerWG.Done()
 	var halfClosed bool
 	for item := range s.outCh {
-		n := int64(len(item.buf))
 		if halfClosed {
 			// 理论不可达：CloseWrite 后 Send 被拒；防御性归还。
-			s.releaseOutbound(n)
+			s.releaseOutItem(item)
 			continue
 		}
 		if s.opts.WriteTimeout > 0 {
 			_ = s.conn.SetWriteDeadline(time.Now().Add(s.opts.WriteTimeout))
 		}
 		_, werr := s.conn.Write(item.buf)
-		s.releaseOutbound(n)
+		s.releaseOutItem(item)
 		if werr != nil {
 			if !s.isForced() && ctx.Err() == nil {
 				s.forceClose(CloseReason{Code: 12, Text: "write failure: " + werr.Error(), Forced: true})
 			}
 			// 排空并归还后续排队项（连接已不可写）。
 			for rest := range s.outCh {
-				s.releaseOutbound(int64(len(rest.buf)))
+				s.releaseOutItem(rest)
 			}
 			return
 		}
